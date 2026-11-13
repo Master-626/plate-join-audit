@@ -1,0 +1,5 @@
+plate,well,time,value
+p1,A1,0,0.1
+p1,A1,10,0.2
+p1,A2,0,0.8
+p1,A2,10,0.9
