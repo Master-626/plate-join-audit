@@ -53,7 +53,11 @@ def _load(path: str | Path, delimiter: str, required: list[str]) -> tuple[list, 
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise AuditError(f"{p.name}: only regular files are supported")
-            data = stream.read(MAX_BYTES + 1)
+            # O_NONBLOCK avoids hanging on a FIFO at open. On POSIX, clear it
+            # for regular files. read() may still return before the full size.
+            if os.name == "posix" and hasattr(os, "set_blocking"):
+                os.set_blocking(stream.fileno(), True)
+            data = _read_bounded(stream, MAX_BYTES + 1)
     except OSError as exc:
         raise AuditError(f"cannot read {p.name}: {exc.strerror}") from exc
     if len(data) > MAX_BYTES:
@@ -74,6 +78,8 @@ def _load(path: str | Path, delimiter: str, required: list[str]) -> tuple[list, 
         if absent:
             raise AuditError(f"{p.name}: missing required columns {sorted(absent)}")
         for index, values in enumerate(reader, start=1):
+            if not any(cell.strip() for cell in values):
+                raise AuditError(f"{p.name}: record {index} is a blank row")
             if len(values) != len(header):
                 raise AuditError(f"{p.name}: record {index} has wrong number of columns")
             records.append((index, dict(zip(header, values))))
@@ -89,8 +95,25 @@ def _load(path: str | Path, delimiter: str, required: list[str]) -> tuple[list, 
     }
 
 
+def _read_bounded(stream, limit):
+    """Read until EOF or limit. A single read() may return early."""
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+        block = stream.read(remaining)
+        if not block:
+            break
+        chunks.append(block)
+        remaining -= len(block)
+    return b"".join(chunks)
+
+
+def _well_sort_key(plate, well):
+    return (plate, well[0], int(well[1:]))
+
+
 def _ordered(keys):
-    return sorted(keys, key=lambda x: (x[0], x[1][0], int(x[1][1:])))
+    return sorted(keys, key=lambda key: _well_sort_key(key[0], key[1]))
 
 
 def audit(
@@ -110,6 +133,8 @@ def audit(
 
     A pass covers key integrity and planned-well presence, not scientific validity,
     numeric measurements, or completeness of time/channel combinations.
+    noncanonical_wells lists raw tokens that are not already canonical; those rows
+    still count as matches.
     """
     normalize_well("A1", plate_size)
     if isinstance(observation_columns, str):
@@ -129,6 +154,7 @@ def audit(
 
     def keys(rows, table, plate_col, well_col):
         found = []
+        aliases = defaultdict(list)
         if not rows:
             issue("empty_table", table, [])
         for index, row in rows:
@@ -137,16 +163,42 @@ def audit(
             if not plate or plate != plate.strip():
                 issue("invalid_plate", table, [index], raw_plate=plate)
                 continue
+            raw_well = row[well_col]
             try:
-                well = normalize_well(row[well_col], plate_size)
+                well = normalize_well(raw_well, plate_size)
             except AuditError as exc:
-                issue("invalid_well", table, [index], raw_well=row[well_col], reason=str(exc))
+                issue("invalid_well", table, [index], raw_well=raw_well, reason=str(exc))
                 continue
+            if raw_well != well:
+                aliases[(plate, well, raw_well)].append(index)
             found.append((index, (plate, well), row))
-        return found
+        return found, aliases
 
-    lkeys = keys(left, "layout", layout_plate, layout_well)
-    rkeys = keys(right, "readings", readings_plate, readings_well)
+    def spelling_entries(table, aliases):
+        return [
+            {
+                "table": table,
+                "plate": plate,
+                "well": well,
+                "raw_well": raw_well,
+                "records": list(records),
+            }
+            for (plate, well, raw_well), records in aliases.items()
+        ]
+
+    lkeys, layout_aliases = keys(left, "layout", layout_plate, layout_well)
+    rkeys, reading_aliases = keys(right, "readings", readings_plate, readings_well)
+    noncanonical = sorted(
+        [
+            *spelling_entries("layout", layout_aliases),
+            *spelling_entries("readings", reading_aliases),
+        ],
+        key=lambda entry: (
+            0 if entry["table"] == "layout" else 1,
+            *_well_sort_key(entry["plate"], entry["well"]),
+            entry["raw_well"],
+        ),
+    )
     layouts = defaultdict(list)
     measurements = defaultdict(list)
     for index, key, row in lkeys:
@@ -160,7 +212,10 @@ def audit(
             issue("invalid_observation", "readings", [index], plate=key[0], well=key[1])
             continue
         measurements[(*key, *values)].append(index)
-    for key, indices in sorted(measurements.items()):
+    for key, indices in sorted(
+        measurements.items(),
+        key=lambda item: (*_well_sort_key(item[0][0], item[0][1]), item[0][2:]),
+    ):
         if len(indices) > 1:
             issue(
                 "duplicate_observation",
@@ -200,7 +255,9 @@ def audit(
             "planned_unique_wells": len(layouts),
             "observed_unique_wells": len(seen),
             "matched_unique_wells": len(set(layouts) & seen),
+            "noncanonical_rows": sum(len(entry["records"]) for entry in noncanonical),
             "issues_by_code": dict(sorted(counts.items())),
         },
+        "noncanonical_wells": noncanonical,
         "issues": issues,
     }

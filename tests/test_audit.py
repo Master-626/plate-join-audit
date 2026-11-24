@@ -1,7 +1,9 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -291,3 +293,183 @@ def test_fifo_rejected_without_blocking(tmp_path):
     )
     assert result.returncode == 2
     assert "only regular files" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "plate,well\n,\n",
+        "plate,well\n , \n",
+        'plate,well\n"",""\n',
+        "plate,well\np,A1\n\n",
+        "plate,well,note\n,,\n",
+        "plate\twell\n\t\n",
+    ],
+)
+def test_blank_rows_are_invalid_input(tmp_path, text):
+    delimiter = "\t" if "\t" in text else ","
+    layout, readings = pair(tmp_path)
+    readings.write_text(text)
+    with pytest.raises(AuditError, match="blank row"):
+        audit(layout, readings, readings_delimiter=delimiter)
+
+
+def test_blank_row_cli_exits_without_a_verdict(tmp_path, capsys):
+    layout, readings = pair(tmp_path, "plate,well\n,\n")
+    out = tmp_path / "out.json"
+    assert main([str(layout), str(readings), "--output", str(out)]) == 2
+    assert not out.exists()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "blank row" in captured.err
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["data.csv", "map.csv"]
+
+
+def test_partial_or_optional_empty_fields_are_not_blank_rows(tmp_path):
+    layout, readings = pair(tmp_path, "plate,well\n,A1\n")
+    report = audit(layout, readings)
+    assert report["summary"]["issues_by_code"]["invalid_plate"] == 1
+    layout, readings = pair(tmp_path, "plate,well,note\np,A1,\n")
+    assert audit(layout, readings)["ok"]
+    readings.write_text("plate,well\np\n")
+    with pytest.raises(AuditError, match="wrong number of columns"):
+        audit(layout, readings)
+
+
+def test_duplicate_observations_use_numeric_well_order(tmp_path):
+    layout, readings = pair(
+        tmp_path,
+        "plate,well,time\n"
+        "p,A10,2\n"
+        "p,A10,2\n"
+        "p,A2,10\n"
+        "p,A2,10\n"
+        "p,A2,2\n"
+        "p,A2,2\n"
+        "p,A1,2\n"
+        "p,A1,2\n",
+        "plate,well\np,A1\np,A2\np,A10\n",
+    )
+    issues = [
+        item
+        for item in audit(layout, readings, observation_columns=("time",))["issues"]
+        if item["code"] == "duplicate_observation"
+    ]
+    assert [(item["well"], item["observation"]["time"]) for item in issues] == [
+        ("A1", "2"),
+        ("A2", "10"),
+        ("A2", "2"),
+        ("A10", "2"),
+    ]
+
+
+def test_short_reads_hash_the_whole_file(tmp_path, monkeypatch):
+    from plate_join_audit import core
+
+    layout, readings = pair(
+        tmp_path,
+        "plate,well,value\np,A1,abcdefghij\np,A2,klmnopqrst\n",
+        "plate,well,group\np,A1,control\np,A2,case\n",
+    )
+    real_fdopen = os.fdopen
+
+    def fdopen(fd, mode="rb", *args, **kwargs):
+        stream = real_fdopen(fd, mode, *args, **kwargs)
+        original = stream.read
+
+        def short(n=-1):
+            if n is None or n < 0:
+                return original()
+            return original(min(int(n), 7))
+
+        stream.read = short
+        return stream
+
+    monkeypatch.setattr(core.os, "fdopen", fdopen)
+    report = audit(layout, readings)
+    assert report["ok"]
+    payload = readings.read_bytes()
+    assert report["sources"]["readings"]["bytes"] == len(payload)
+    assert report["sources"]["readings"]["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert report["summary"]["matched_unique_wells"] == 2
+
+
+def test_noncanonical_spellings_stay_matches(tmp_path):
+    layout, readings = pair(
+        tmp_path,
+        "plate,well\nm,A1\np,A2\np,A10\n",
+        "plate,well\np,a02\np,A010\nm,A1\n",
+    )
+    report = audit(layout, readings)
+    assert report["ok"]
+    assert report["noncanonical_wells"] == [
+        {
+            "table": "layout",
+            "plate": "p",
+            "well": "A2",
+            "raw_well": "a02",
+            "records": [1],
+        },
+        {
+            "table": "layout",
+            "plate": "p",
+            "well": "A10",
+            "raw_well": "A010",
+            "records": [2],
+        },
+    ]
+    assert report["summary"]["noncanonical_rows"] == 2
+
+
+def test_noncanonical_spellings_group_rows_and_sort_tables(tmp_path):
+    layout, readings = pair(
+        tmp_path,
+        "plate,well\nz,A01\nz,a1\nz,A01\n",
+        "plate,well\nz,A1\n",
+    )
+    report = audit(layout, readings)
+    assert report["noncanonical_wells"] == [
+        {
+            "table": "readings",
+            "plate": "z",
+            "well": "A1",
+            "raw_well": "A01",
+            "records": [1, 3],
+        },
+        {
+            "table": "readings",
+            "plate": "z",
+            "well": "A1",
+            "raw_well": "a1",
+            "records": [2],
+        },
+    ]
+    assert report["summary"]["noncanonical_rows"] == 3
+    assert report["summary"]["issues_by_code"]["duplicate_observation"] == 1
+
+    layout, readings = pair(tmp_path, "plate,well\na,a1\n", "plate,well\nz,A01\n")
+    report = audit(layout, readings)
+    assert [(item["table"], item["plate"]) for item in report["noncanonical_wells"]] == [
+        ("layout", "z"),
+        ("readings", "a"),
+    ]
+
+
+def test_example_files_list_real_aliases():
+    root = Path(__file__).resolve().parents[1]
+    report = audit(root / "examples" / "layout.csv", root / "examples" / "readings.csv")
+    assert report["ok"]
+    assert report["noncanonical_wells"] == [
+        {"table": "layout", "plate": "p1", "well": "A1", "raw_well": "A01", "records": [1]},
+        {"table": "layout", "plate": "p1", "well": "A2", "raw_well": "A02", "records": [2]},
+        {"table": "readings", "plate": "p1", "well": "A1", "raw_well": "a1", "records": [1]},
+    ]
+    assert report["summary"]["noncanonical_rows"] == 3
+    series = audit(
+        root / "examples" / "layout.csv",
+        root / "examples" / "time-series.csv",
+        observation_columns=("time",),
+    )
+    assert series["ok"]
+    assert [item["raw_well"] for item in series["noncanonical_wells"]] == ["A01", "A02"]
+    assert all(item["table"] == "layout" for item in series["noncanonical_wells"])
