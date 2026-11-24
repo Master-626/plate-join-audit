@@ -31,7 +31,7 @@ try:
 except AuditError as exc:
     print(f"Cannot audit: {exc}")
 else:
-    print(report["ok"], report["issues"])
+    print(report["ok"], report["summary"]["noncanonical_rows"], report["issues"])
 ```
 
 ## Data contract
@@ -45,11 +45,15 @@ Use --layout-tsv / --readings-tsv for tabs. See --help for every option.
   Python CSV parser field limits also apply (normally 131,072 characters per field).
   Oversized fields fail explicitly; the library does not change global parser settings.
 * Duplicate/blank headers, malformed CSV, blank rows, ragged rows and NUL bytes fail.
+  A blank row is an empty record, or one whose fields are all empty or whitespace
+  (including a delimiter-only line such as `,,`). It is rejected before any verdict.
 * Record references are 1-based **data record numbers**, not physical line numbers.
 * Plate IDs are case-sensitive, nonempty, and cannot have surrounding whitespace.
 * Well aliases A01/a1/ A1 normalize to A1. Only ASCII coordinates are accepted.
   **Your subsequent join must use the same normalization on both tables.** A passing
   audit does not make raw A01/a1 strings equal; use the exported normalize_well function.
+  Rows whose raw token is not already canonical are listed in noncanonical_wells
+  and counted as summary.noncanonical_rows. Those rows still match.
 * Select one geometry for both files: 6, 12, 24, 48, 96 (default), or 384 wells.
   Partial layouts are supported; unlisted wells are unexpected, not implicitly blank.
 * Layout keys (plate, canonical well) must be unique.
@@ -62,8 +66,9 @@ Use --layout-tsv / --readings-tsv for tabs. See --help for every option.
   correctness, time/channel completeness, plate orientation or instrument compatibility.
 
 Schema v1 JSON includes SHA-256 hashes of the exact source bytes, input basenames,
-options, summary counts and structured issues. Reports may contain plate IDs and
-observation labels; review before sharing. No network access or telemetry is used.
+options, summary counts, noncanonical well spellings and structured issues.
+Reports may contain plate IDs and observation labels; review before sharing.
+No network access or telemetry is used.
 
 ## Development
 
@@ -79,6 +84,7 @@ python -m build
 合并板图与酶标仪长表前，检查板位归一化冲突、重复观测、缺失和多余板位。
 默认一孔一条读数；时间序列用 `--observation-column time` 显式指定唯一键，
 多个维度可重复指定。只检查关联键及计划孔覆盖，不检查数值、实验结果或时间点完整性。
+报告中的 noncanonical_wells 列出 A01、a1 这类尚未规范化的孔位写法，便于合并前统一；这些行仍视为同一孔。
 输入文件只读，不自动修复。报告可能包含样本相关标识，分享前请检查。
 不修改任何现有项目；本项目与 Wellmap 没有隶属关系。
 
